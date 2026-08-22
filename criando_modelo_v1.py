@@ -12,6 +12,7 @@ from langchain.agents.middleware import (
     ModelRequest,
     ModelResponse,
 )
+from langchain.agents.middleware import SummarizationMiddleware  
 
 from langgraph.types import Command
 from langgraph.checkpoint.memory import InMemorySaver
@@ -212,6 +213,29 @@ def registrar_informacoes_orcamento(
 
 
 # ==========================================================
+# TOOL - VOLTAR PARA COLETA
+# ==========================================================
+
+@tool
+def voltar_para_coleta_informacoes(
+    runtime: ToolRuntime[None, EstadoSuporte],
+) -> Command:
+    """Volta para coleta quando as informações estiverem incorretas."""
+
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content="Cliente solicitou correção das informações.",
+                    tool_call_id=runtime.tool_call_id,
+                )
+            ],
+            "informacoes_validas": "incorreto",
+            "etapa_atual": "coleta_informacoes",
+        }
+    )
+
+# ==========================================================
 # PROMPTS
 # ==========================================================
 
@@ -304,6 +328,32 @@ Resposta:
 """
 
 
+VALIDACAO_INFORMACOES_PROMPT = """
+Você é um assistente responsável por auxiliar clientes
+na geração de orçamentos.
+
+ETAPA ATUAL: Validação das informações
+
+INFORMAÇÕES COLETADAS:
+
+Quantidade de pessoas:
+{quantidade_pessoas}
+
+Região:
+{regiao}
+
+Nesta etapa:
+
+1. Apresente as informações coletadas ao cliente.
+2. Pergunte se as informações estão corretas.
+3. Se o cliente informar que algum dado está incorreto,
+   use voltar_para_coleta_informacoes.
+4. Se estiver tudo correto, avance para geração do orçamento.
+
+Não gere o orçamento antes da confirmação.
+"""
+
+
 # ==========================================================
 # CONFIGURAÇÃO DAS ETAPAS
 # ==========================================================
@@ -349,6 +399,20 @@ CONFIG_ETAPAS = {
             "produto_localizado",
         ],
     },
+
+
+  "validacao_informacoes": {
+    "prompt": VALIDACAO_INFORMACOES_PROMPT,
+
+    "tools": [
+        voltar_para_coleta_informacoes
+    ],
+
+    "requires": [
+        "quantidade_pessoas",
+        "regiao",
+    ],
+},
 
 }
 
@@ -408,6 +472,7 @@ todas_tools = [
     localizar_cadastro_cliente,
     localizar_produto_cliente,
     registrar_informacoes_orcamento,
+    voltar_para_coleta_informacoes
 ]
 
 
@@ -416,7 +481,12 @@ agente = create_agent(
     tools=todas_tools,
     state_schema=EstadoSuporte,
     middleware=[
-        aplicando_configuracao_etapa_atual
+        aplicando_configuracao_etapa_atual,
+        SummarizationMiddleware(
+        model=model,
+            trigger=("tokens", 4000),
+            keep=("messages", 10)
+        )
     ],
     checkpointer=InMemorySaver(),
 )
