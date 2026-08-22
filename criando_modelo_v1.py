@@ -1,15 +1,22 @@
 import os
 from dotenv import load_dotenv
-from typing import Literal
-
+from typing import Literal, Callable
 from typing_extensions import NotRequired
 
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentState, create_agent
 from langchain.tools import tool, ToolRuntime
-from langchain.messages import ToolMessage
+from langchain.messages import ToolMessage, HumanMessage
+from langchain.agents.middleware import (
+    wrap_model_call,
+    ModelRequest,
+    ModelResponse,
+)
 
 from langgraph.types import Command
+from langgraph.checkpoint.memory import InMemorySaver
+
+from langchain_core.utils.uuid import uuid7
 
 
 # ==========================================================
@@ -85,6 +92,15 @@ class EstadoSuporte(AgentState):
 # TOOLS
 # ==========================================================
 
+
+# ----------------------------------------------------------
+# SIMULAÇÃO 1
+# Cliente localizado
+# ----------------------------------------------------------
+
+cliente = "localizado"
+
+
 @tool
 def localizar_cadastro_cliente(
     status: Literal["localizado", "nao_localizado"],
@@ -92,11 +108,17 @@ def localizar_cadastro_cliente(
 ) -> Command:
     """Registra se o cadastro do cliente foi localizado no sistema."""
 
-    proxima_etapa = (
-        "consulta_produtos"
-        if status == "localizado"
-        else "identificacao_cliente"
-    )
+    # Sobrescreve o status conforme o resultado
+    # simulado da consulta.
+    if cliente == "localizado":
+
+        status = "localizado"
+        proxima_etapa = "consulta_produtos"
+
+    else:
+
+        status = "nao_localizado"
+        proxima_etapa = "identificacao_cliente"
 
     return Command(
         update={
@@ -109,10 +131,19 @@ def localizar_cadastro_cliente(
                     tool_call_id=runtime.tool_call_id,
                 )
             ],
+
             "cliente_localizado": status,
             "etapa_atual": proxima_etapa,
         }
     )
+
+
+# ----------------------------------------------------------
+# SIMULAÇÃO 2
+# Produto NÃO localizado
+# ----------------------------------------------------------
+
+produto = "nao_localizado"
 
 
 @tool
@@ -122,11 +153,17 @@ def localizar_produto_cliente(
 ) -> Command:
     """Registra se o produto do cliente foi localizado no sistema."""
 
-    proxima_etapa = (
-        "coleta_informacoes"
-        if status == "localizado"
-        else "consulta_produtos"
-    )
+    # Sobrescreve o status conforme o resultado
+    # simulado da consulta.
+    if produto == "localizado":
+
+        status = "localizado"
+        proxima_etapa = "coleta_informacoes"
+
+    else:
+
+        status = "nao_localizado"
+        proxima_etapa = "consulta_produtos"
 
     return Command(
         update={
@@ -139,6 +176,7 @@ def localizar_produto_cliente(
                     tool_call_id=runtime.tool_call_id,
                 )
             ],
+
             "produto_localizado": status,
             "etapa_atual": proxima_etapa,
         }
@@ -165,6 +203,7 @@ def registrar_informacoes_orcamento(
                     tool_call_id=runtime.tool_call_id,
                 )
             ],
+
             "quantidade_pessoas": quantidade_pessoas,
             "regiao": regiao,
             "etapa_atual": "validacao_informacoes",
@@ -175,6 +214,7 @@ def registrar_informacoes_orcamento(
 # ==========================================================
 # PROMPTS
 # ==========================================================
+
 
 IDENTIFICACAO_CLIENTE_PROMPT = """
 Você é um assistente responsável por auxiliar clientes
@@ -191,6 +231,11 @@ Nesta etapa:
 2. Identifique o cliente no sistema.
 3. Use localizar_cadastro_cliente para registrar o resultado.
 4. Se o cliente for localizado, avance para consulta dos produtos.
+
+Se o cliente não for localizado:
+- Informe que o cadastro não foi localizado.
+- Não avance para a consulta dos produtos.
+- Não solicite informações do orçamento.
 
 Não solicite informações do orçamento nesta etapa.
 """
@@ -214,6 +259,10 @@ Nesta etapa:
 2. Identifique o produto relacionado ao orçamento.
 3. Use localizar_produto_cliente para registrar o resultado.
 4. Se o produto for localizado, avance para coleta das informações.
+
+Se o produto não for localizado:
+- Informe ao cliente que o produto não foi localizado.
+- Não avance para coleta das informações.
 
 Não invente produtos ou preços.
 """
@@ -262,28 +311,39 @@ Resposta:
 CONFIG_ETAPAS = {
 
     "identificacao_cliente": {
+
         "prompt": IDENTIFICACAO_CLIENTE_PROMPT,
+
         "tools": [
             localizar_cadastro_cliente
         ],
+
         "requires": [],
     },
 
+
     "consulta_produtos": {
+
         "prompt": CONSULTA_PRODUTOS_PROMPT,
+
         "tools": [
             localizar_produto_cliente
         ],
+
         "requires": [
             "cliente_localizado"
         ],
     },
 
+
     "coleta_informacoes": {
+
         "prompt": COLETA_INFORMACOES_PROMPT,
+
         "tools": [
             registrar_informacoes_orcamento
         ],
+
         "requires": [
             "cliente_localizado",
             "produto_localizado",
@@ -294,176 +354,180 @@ CONFIG_ETAPAS = {
 
 
 # ==========================================================
+# MIDDLEWARE
+# ==========================================================
+
+@wrap_model_call
+def aplicando_configuracao_etapa_atual(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], ModelResponse],
+) -> ModelResponse:
+    """Configura o comportamento do agente com base na etapa atual."""
+
+    # 1. Obtém a etapa atual.
+    # Se não existir, inicia em identificacao_cliente.
+    etapa_atual = request.state.get(
+        "etapa_atual",
+        "identificacao_cliente"
+    )
+
+    # 2. Consulta a configuração da etapa atual.
+    estagio_configuracao = CONFIG_ETAPAS[etapa_atual]
+
+    # 3. Valida os campos obrigatórios.
+    for key in estagio_configuracao["requires"]:
+
+        if request.state.get(key) is None:
+
+            raise ValueError(
+                f"{key} deve ser definido "
+                f"antes de chegar a {etapa_atual}"
+            )
+
+    # 4. Monta o prompt usando os dados do State.
+    system_prompt = estagio_configuracao["prompt"].format(
+        **request.state
+    )
+
+    # 5. Define prompt e tools disponíveis
+    # somente para a etapa atual.
+    request = request.override(
+        system_prompt=system_prompt,
+        tools=estagio_configuracao["tools"],
+    )
+
+    # 6. Continua a execução.
+    return handler(request)
+
+
+# ==========================================================
 # AGENTE
 # ==========================================================
 
+todas_tools = [
+    localizar_cadastro_cliente,
+    localizar_produto_cliente,
+    registrar_informacoes_orcamento,
+]
+
+
 agente = create_agent(
-    model=model,
-    tools=[
-        localizar_cadastro_cliente,
-        localizar_produto_cliente,
-        registrar_informacoes_orcamento,
-    ],
+    model,
+    tools=todas_tools,
     state_schema=EstadoSuporte,
+    middleware=[
+        aplicando_configuracao_etapa_atual
+    ],
+    checkpointer=InMemorySaver(),
 )
 
 
 # ==========================================================
-# FUNÇÃO PARA EXIBIR STATE
+# CRIAR THREAD DA CONVERSA
 # ==========================================================
 
-def mostrar_estado(resultado):
+thread_id = str(uuid7())
 
-    print("\n===================================")
-    print("        ESTADO ATUAL DO CHAT")
-    print("===================================")
-
-    print(
-        "Etapa atual:",
-        resultado.get("etapa_atual")
-    )
-
-    print(
-        "Cliente localizado:",
-        resultado.get("cliente_localizado")
-    )
-
-    print(
-        "Produto localizado:",
-        resultado.get("produto_localizado")
-    )
-
-    print(
-        "Quantidade de pessoas:",
-        resultado.get("quantidade_pessoas")
-    )
-
-    print(
-        "Região:",
-        resultado.get("regiao")
-    )
-
-    print(
-        "Informações válidas:",
-        resultado.get("informacoes_validas")
-    )
-
-    print(
-        "Orçamento gerado:",
-        resultado.get("orcamento_gerado")
-    )
-
-    print(
-        "Cliente confirmou:",
-        resultado.get("cliente_confirmou")
-    )
-
-    print(
-        "Orçamento enviado:",
-        resultado.get("orcamento_enviado")
-    )
-
-    print("===================================")
+config = {
+    "configurable": {
+        "thread_id": thread_id
+    }
+}
 
 
 # ==========================================================
-# TESTE 1 - IDENTIFICAR CLIENTE
+# TURNO 1
+# IDENTIFICAÇÃO DO CLIENTE
 # ==========================================================
 
-resultado = agente.invoke(
+print("\n========================================")
+print("TURNO 1 - IDENTIFICAÇÃO DO CLIENTE")
+print("========================================")
+
+
+result = agente.invoke(
     {
         "messages": [
-            {
-                "role": "user",
-                "content":
-                    "O cadastro do cliente foi localizado."
-            }
-        ],
-
-        "etapa_atual":
-            "identificacao_cliente",
-    }
+            HumanMessage(
+                content="Olá, gostaria de fazer um orçamento!"
+            )
+        ]
+    },
+    config
 )
 
-print("\n--- APÓS IDENTIFICAR CLIENTE ---")
 
-mostrar_estado(resultado)
+print("\n--- ESTADO APÓS TURNO 1 ---")
+
+print(
+    "Cliente localizado:",
+    result.get("cliente_localizado")
+)
+
+print(
+    "Produto localizado:",
+    result.get("produto_localizado")
+)
+
+print(
+    "Etapa atual:",
+    result.get("etapa_atual")
+)
 
 
 # ==========================================================
-# TESTE 2 - LOCALIZAR PRODUTO
+# TURNO 2
+# CONSULTA DO PRODUTO
 # ==========================================================
 
-resultado = agente.invoke(
+print("\n========================================")
+print("TURNO 2 - CONSULTA DO PRODUTO")
+print("========================================")
+
+
+result = agente.invoke(
     {
-        "messages":
-            resultado["messages"]
-            + [
-                {
-                    "role": "user",
-                    "content":
-                        "O produto do cliente foi localizado."
-                }
-            ],
-
-        "etapa_atual":
-            resultado.get("etapa_atual"),
-
-        "cliente_localizado":
-            resultado.get("cliente_localizado"),
-    }
+        "messages": [
+            HumanMessage(
+                content=(
+                    "Quero fazer um orçamento "
+                    "do meu produto cadastrado."
+                )
+            )
+        ]
+    },
+    config
 )
 
-print("\n--- APÓS LOCALIZAR PRODUTO ---")
 
-mostrar_estado(resultado)
+print("\n--- ESTADO APÓS TURNO 2 ---")
 
-
-# ==========================================================
-# TESTE 3 - COLETAR DADOS DO ORÇAMENTO
-# ==========================================================
-
-resultado = agente.invoke(
-    {
-        "messages":
-            resultado["messages"]
-            + [
-                {
-                    "role": "user",
-                    "content":
-                        (
-                            "Quero um orçamento para "
-                            "50 pessoas na região "
-                            "de Santo André."
-                        )
-                }
-            ],
-
-        "etapa_atual":
-            resultado.get("etapa_atual"),
-
-        "cliente_localizado":
-            resultado.get("cliente_localizado"),
-
-        "produto_localizado":
-            resultado.get("produto_localizado"),
-    }
+print(
+    "Cliente localizado:",
+    result.get("cliente_localizado")
 )
 
-print("\n--- APÓS COLETAR INFORMAÇÕES ---")
+print(
+    "Produto localizado:",
+    result.get("produto_localizado")
+)
 
-mostrar_estado(resultado)
+print(
+    "Etapa atual:",
+    result.get("etapa_atual")
+)
 
 
 # ==========================================================
-# HISTÓRICO DAS MENSAGENS
+# HISTÓRICO COMPLETO
 # ==========================================================
 
-print("\n===================================")
-print("       HISTÓRICO DO AGENTE")
-print("===================================")
+print("\n========================================")
+print("HISTÓRICO DO AGENTE")
+print("========================================")
 
-for mensagem in resultado["messages"]:
+
+for mensagem in result["messages"]:
 
     print(
         f"\nTipo: "
